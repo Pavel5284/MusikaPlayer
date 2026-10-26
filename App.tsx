@@ -26,10 +26,7 @@ import {
     useAudioPlayerStatus,
 } from 'expo-audio';
 import * as FileSystem from 'expo-file-system/legacy';
-import {
-    SafeAreaProvider,
-    SafeAreaView,
-} from 'react-native-safe-area-context';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 type Tab = 'browser' | 'library';
 
@@ -73,26 +70,27 @@ interface BlobTransfer {
 // а в коде они по-прежнему проверяются во время выполнения.
 type WebViewIncomingMessage =
     | {
-        type: 'download';
-        url?: string;
-        title?: string;
-        referrer?: string;
-        cookie?: string;
-        userAgent?: string;
-        mimeType?: string;
-    }
+    type: 'download';
+    url?: string;
+    title?: string;
+    referrer?: string;
+    cookie?: string;
+    userAgent?: string;
+    mimeType?: string;
+}
     | {
-        type: 'blobCandidate';
-        token?: string;
-        title?: string;
-        mimeType?: string;
-        size?: number;
-        contentDisposition?: string;
-    }
+    type: 'blobCandidate';
+    token?: string;
+    title?: string;
+    mimeType?: string;
+    size?: number;
+    contentDisposition?: string;
+}
     | { type: 'blobStart'; id: string; title?: string; mimeType?: string; size?: number }
     | { type: 'blobChunk'; id: string; data?: unknown }
     | { type: 'blobEnd'; id: string }
     | { type: 'blobError'; id: string; message?: string }
+    | { type: 'downloadIntent'; href?: string; title?: string; sourceUrl?: string }
     | { type: 'notice'; message?: string };
 
 type BlobCandidateMessage = Extract<WebViewIncomingMessage, { type: 'blobCandidate' }>;
@@ -182,11 +180,28 @@ function isBlockedAdUrl(rawUrl: string): boolean {
 function getAudioExtension(rawUrl: string): string {
     try {
         const parsed = new URL(rawUrl);
-        const candidates = [parsed.pathname, parsed.search];
-        for (const candidate of candidates) {
-            let decoded = candidate;
+
+        // Сначала проверяем расширение самого пути. Не ищем .mp3 в произвольной
+        // query-строке: рекламная/промежуточная страница может содержать вложенный
+        // URL на MP3 (например, параметр wpdlf=https://site/file.mp3), но сама
+        // при этом остаётся HTML-страницей, которую нужно открыть в модальном окне.
+        let pathname = parsed.pathname;
+        try {
+            pathname = decodeURIComponent(pathname);
+        } catch (_decodeError) {}
+        const pathMatch = pathname.match(/\.([a-z0-9]{2,5})$/i);
+        if (pathMatch && AUDIO_EXTENSIONS.includes(pathMatch[1].toLowerCase())) {
+            return pathMatch[1].toLowerCase();
+        }
+
+        // Поддерживаем обычные filename/file/download параметры, если в них указано
+        // простое имя файла. Не разбираем параметры, которые содержат вложенный URL.
+        for (const key of ['filename', 'file', 'download', 'name']) {
+            const value = parsed.searchParams.get(key);
+            if (!value || /^(?:https?:\/\/|blob:|data:)/i.test(value.trim())) continue;
+            let decoded = value;
             try {
-                decoded = decodeURIComponent(candidate);
+                decoded = decodeURIComponent(value);
             } catch (_decodeError) {}
             const match = decoded.match(/\.([a-z0-9]{2,5})(?:[?#&]|$)/i);
             if (match && AUDIO_EXTENSIONS.includes(match[1].toLowerCase())) {
@@ -336,27 +351,6 @@ function isLikelyWebResponse(mimeType: unknown): boolean {
         || normalized.includes('xml');
 }
 
-function getBaseHost(host: unknown): string {
-    const parts = String(host || '').toLowerCase().split('.').filter(Boolean);
-    return parts.length <= 2 ? parts.join('.') : parts.slice(-2).join('.');
-}
-
-function isSameSiteUrl(rawUrl: string, currentUrl: string): boolean {
-    try {
-        const target = new URL(rawUrl);
-        const current = new URL(currentUrl);
-        if (target.protocol !== 'https:' && target.protocol !== 'http:') return false;
-        const targetHost = target.hostname.toLowerCase();
-        const currentHost = current.hostname.toLowerCase();
-        return targetHost === currentHost
-            || targetHost.endsWith(`.${currentHost}`)
-            || currentHost.endsWith(`.${targetHost}`)
-            || getBaseHost(targetHost) === getBaseHost(currentHost);
-    } catch (_error) {
-        return false;
-    }
-}
-
 function isLikelyFileDownloadUrl(rawUrl: string): boolean {
     if (getAudioExtension(rawUrl)) return true;
     try {
@@ -403,6 +397,10 @@ function getErrorMessage(error: unknown, fallback: string): string {
 // Это не полноценный системный AdBlock и может не поймать рекламу с самого сайта.
 const WEB_FILTER_SCRIPT = `
 (function () {
+  // Этот скрипт назначен и на раннюю, и на обычную инъекцию.
+  // Не регистрируем обработчики повторно в одном и том же frame.
+  if (window.__MUSIKA_WEB_FILTER_INSTALLED__) return true;
+  window.__MUSIKA_WEB_FILTER_INSTALLED__ = true;
   try {
     var audioRe = /\\.(mp3|m4a|aac|wav|ogg|oga|flac)(?:[?#]|$)/i;
     var blockedDomains = ${JSON.stringify(BLOCKED_AD_DOMAINS)};
@@ -455,6 +453,9 @@ const WEB_FILTER_SCRIPT = `
     var blobStore = {};
     var announcedBlobUrls = {};
     var lastUserGestureAt = 0;
+    // Обновляется, когда обработчик страницы или window.open уже инициировал
+    // открытие окна/скачивание. Это не даёт резервному обработчику дублировать действие.
+    var lastPopupActivityAt = 0;
     var BLOB_CHUNK_SIZE = 96 * 1024; // кратно 3, чтобы куски base64 склеивались без потерь
 
     function isWebMime(type) {
@@ -665,6 +666,7 @@ const WEB_FILTER_SCRIPT = `
     }
 
     function sendDownload(url, title) {
+      lastPopupActivityAt = Date.now();
       var cookie = '';
       try { cookie = document.cookie || ''; } catch (e) {}
       tellApp({
@@ -678,31 +680,19 @@ const WEB_FILTER_SCRIPT = `
     }
 
     function openInCurrentPage(url) {
-      if (isBlocked(url)) {
-        tellApp({ type: 'notice', message: 'Рекламный переход заблокирован.' });
-        return;
-      }
-      if (isBrowserMadeFile(url)) {
-        announceBlobUrl(url, '', '');
-        return;
-      }
-      if (isLikelyFileDownload(url)) {
-        sendDownload(url, '');
-        return;
-      }
-      // Раньше здесь всегда показывалось «Всплывающее окно заблокировано».
-      // Из-за этого кнопка «Скачать» на сайтах, открывающих страницу в новой вкладке,
-      // ничего не делала. Теперь такая страница открывается в текущей вкладке.
-      window.location.assign(url);
+      // Отдельные окна не создаём. Обычные страницы открываем в текущем WebView,
+      // а прямые аудиофайлы отправляем в загрузчик приложения.
+      handlePopupUrl(url, '');
     }
 
     function handlePopupUrl(rawUrl, title) {
       var resolvedUrl = absoluteUrl(rawUrl);
       if (!resolvedUrl) return;
       if (isBlocked(resolvedUrl)) {
-        tellApp({ type: 'notice', message: 'Рекламное всплывающее окно заблокировано.' });
+        tellApp({ type: 'notice', message: 'Рекламный переход заблокирован.' });
         return;
       }
+      lastPopupActivityAt = Date.now();
       if (isBrowserMadeFile(resolvedUrl)) {
         announceBlobUrl(resolvedUrl, title || '', '');
         return;
@@ -711,14 +701,13 @@ const WEB_FILTER_SCRIPT = `
         sendDownload(resolvedUrl, title || '');
         return;
       }
-      if (isSameSite(resolvedUrl)) {
-        window.location.assign(resolvedUrl);
+      // Ссылки target=_blank и window.open открываем в текущей странице,
+      // не создавая попап и не блокируя обычную навигацию на другой домен.
+      if (/^https?:\\/\\//i.test(resolvedUrl)) {
+        if (resolvedUrl !== location.href) window.location.assign(resolvedUrl);
         return;
       }
-      tellApp({
-        type: 'notice',
-        message: 'Всплывающее окно заблокировано. Если это нужная страница, открой ссылку ещё раз в текущей вкладке.'
-      });
+      tellApp({ type: 'notice', message: 'Эта ссылка не поддерживается во встроенном браузере.' });
     }
 
     // Некоторые сайты сначала открывают пустое окно, а адрес задают позже:
@@ -788,7 +777,7 @@ const WEB_FILTER_SCRIPT = `
       return proxy;
     }
 
-    // Не позволяем странице создавать рекламные вкладки. Нативный onOpenWindow — второй рубеж.
+    // Не позволяем странице создавать отдельные окна. Нативный onOpenWindow — второй рубеж.
     window.open = function (rawUrl) {
       var value = rawUrl === undefined || rawUrl === null ? '' : String(rawUrl).trim();
       if (value && !/^about:blank/i.test(value)) {
@@ -813,16 +802,128 @@ const WEB_FILTER_SCRIPT = `
       return null;
     }
 
-    // window + capture: обработчик должен сработать раньше скриптов самого сайта.
+    // На muzpro кнопка «Скачать трек» имеет href="javascript:void(0)",
+    // а прямой MP3 URL находится в data-track у соседнего .fplay-wr.js-item.
+    // Получаем URL напрямую, не открываем промежуточную рекламную страницу.
+    function findTrackForDownloadButton(button) {
+      function directTrack(element) {
+        if (!element || element.nodeType !== 1) return null;
+        if (element.matches && element.matches('.js-item[data-track]')) return element;
+        return null;
+      }
+      function tracksInside(element) {
+        if (!element || !element.querySelectorAll) return [];
+        var found = [];
+        var own = directTrack(element);
+        if (own) found.push(own);
+        var nested = element.querySelectorAll('.js-item[data-track]');
+        for (var i = 0; i < nested.length; i += 1) {
+          if (found.indexOf(nested[i]) === -1) found.push(nested[i]);
+        }
+        return found;
+      }
+
+      // Сначала ищем соседний плеер: в карточке трека он обычно стоит перед .fdl.
+      var current = button;
+      for (var depth = 0; current && depth < 6; depth += 1) {
+        var sibling = current.previousElementSibling;
+        var siblingDepth = 0;
+        while (sibling && siblingDepth < 5) {
+          var siblingTracks = tracksInside(sibling);
+          if (siblingTracks.length === 1) return siblingTracks[0];
+          if (siblingTracks.length > 1) break;
+          sibling = sibling.previousElementSibling;
+          siblingDepth += 1;
+        }
+
+        var parent = current.parentElement;
+        if (!parent) break;
+        var parentTracks = tracksInside(parent);
+        if (parentTracks.length === 1) return parentTracks[0];
+        current = parent;
+      }
+
+      // Безопасный запасной путь: используем единственный трек на странице,
+      // но не выбираем случайный трек, если их несколько.
+      var pageTracks = document.querySelectorAll('.fplay-wr.js-item[data-track], .js-item[data-track]');
+      if (pageTracks.length === 1) return pageTracks[0];
+      return null;
+    }
+
+    function getTrackDownloadTitle(track) {
+      if (!track) return document.title || 'audio';
+      var artist = track.getAttribute('data-artist') || '';
+      var title = track.getAttribute('data-title') || '';
+      if (!title) {
+        var titleNode = track.querySelector('.fbtn-title');
+        title = titleNode ? String(titleNode.textContent || '').trim() : '';
+      }
+      var combined = [artist.trim(), title.trim()].filter(Boolean).join(' - ');
+      return combined || document.title || 'audio';
+    }
+
+    // Перехватываем клики на этапе capture. Специальный обработчик для .fdl
+    // выполняется раньше скрипта сайта, потому что его href — javascript:void(0).
     window.addEventListener('click', function (event) {
       lastUserGestureAt = Date.now();
+
+      var targetNode = event.target;
+      var downloadButton = null;
+      try {
+        var path = event.composedPath ? event.composedPath() : [];
+        for (var pathIndex = 0; pathIndex < path.length; pathIndex += 1) {
+          var pathNode = path[pathIndex];
+          if (pathNode && pathNode.nodeType === 1 && pathNode.matches && pathNode.matches('a.fdl, button.fdl, .fbtn.fdl')) {
+            downloadButton = pathNode;
+            break;
+          }
+        }
+      } catch (e) {}
+      if (!downloadButton && targetNode && targetNode.closest) {
+        downloadButton = targetNode.closest('a.fdl, button.fdl, .fbtn.fdl');
+      }
+
+      if (downloadButton) {
+        var trackElement = findTrackForDownloadButton(downloadButton);
+        var trackUrl = trackElement ? absoluteUrl(trackElement.getAttribute('data-track') || '') : '';
+        if (trackUrl && /^https?:\\/\\//i.test(trackUrl)) {
+          var trackTitle = getTrackDownloadTitle(trackElement);
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          sendDownload(trackUrl, trackTitle);
+          return;
+        }
+        tellApp({
+          type: 'notice',
+          message: 'Не удалось найти data-track рядом с кнопкой скачивания. Проверь структуру карточки трека на сайте.'
+        });
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
+
       var node = findAnchor(event);
-      if (!node || !node.href) return;
-      var href = node.href;
+      if (!node) return;
+
       var rawHref = '';
       try { rawHref = node.getAttribute('href') || ''; } catch (e) {}
-      // Ссылки-заглушки не трогаем: сайт сам создаст ссылку на blob внутри своего обработчика.
       if (!rawHref || /^(#|javascript:)/i.test(rawHref)) return;
+
+      var href = absoluteUrl(rawHref) || node.href || '';
+      if (!href) return;
+
+      var label = '';
+      try {
+        label = [
+          node.textContent || '',
+          node.getAttribute('aria-label') || '',
+          node.getAttribute('title') || '',
+          node.getAttribute('download') || ''
+        ].join(' ').replace(/\s+/g, ' ').trim();
+      } catch (e) {}
+      var isDownloadAction = /скач|download|загрузить|сохранить/i.test(label);
+      var target = String(node.getAttribute('target') || node.target || '').toLowerCase();
+      var opensNewWindow = target === '_blank';
 
       if (isBlocked(href)) {
         event.preventDefault();
@@ -831,28 +932,50 @@ const WEB_FILTER_SCRIPT = `
         return;
       }
 
-      // Файл, который сайт сформировал внутри браузера: blob: или data:.
-      if (isBrowserMadeFile(href)) {
+      // target=_blank переводим в текущую вкладку. Обработчику сайта даём
+      // выполнить onclick, чтобы он мог вычислить фактический адрес назначения.
+      // downloadIntent отправляем только для ссылок, похожих на скачивание:
+      // обычные ссылки на другие сайты не должны попадать под блокировку загрузки.
+      if (opensNewWindow || isDownloadAction) {
         event.preventDefault();
-        event.stopImmediatePropagation();
-        var blobTitle = getDownloadTitle(node);
-        announceBlobUrl(href, blobTitle, '');
+        var activityAtClick = lastPopupActivityAt;
+        var title = getDownloadTitle(node);
+        if (isDownloadAction) {
+          tellApp({
+            type: 'downloadIntent',
+            href: href,
+            title: title,
+            sourceUrl: location.href
+          });
+        }
+        setTimeout(function () {
+          if (lastPopupActivityAt !== activityAtClick) return;
+          if (isBlocked(href)) return;
+          if (isBrowserMadeFile(href)) {
+            announceBlobUrl(href, title, '');
+          } else if (audioRe.test(href) || node.hasAttribute('download') || isLikelyFileDownload(href)) {
+            sendDownload(href, title);
+          } else {
+            handlePopupUrl(href, title);
+          }
+        }, 900);
+        // Не вызываем stopImmediatePropagation(): скрипт сайта может вычислять URL.
         return;
       }
 
-      // Прямая ссылка на аудиофайл, ссылка с атрибутом download или адрес
-      // вида /download.php?id=... (расширения у него может не быть).
+      // Файлы, созданные внутри браузера (blob/data), скачиваем напрямую.
+      if (isBrowserMadeFile(href)) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        announceBlobUrl(href, getDownloadTitle(node), '');
+        return;
+      }
+
+      // Обычные ссылки на аудиофайлы сохраняем в библиотеку приложения.
       if (audioRe.test(href) || node.hasAttribute('download') || isLikelyFileDownload(href)) {
         event.preventDefault();
         event.stopImmediatePropagation();
         sendDownload(href, getDownloadTitle(node));
-        return;
-      }
-
-      if (node.target === '_blank') {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        openInCurrentPage(href);
       }
     }, true);
 
@@ -946,9 +1069,17 @@ const WEB_FILTER_SCRIPT = `
       }
     }
 
-    removeKnownAds();
-    var observer = new MutationObserver(removeKnownAds);
-    observer.observe(document.documentElement, { childList: true, subtree: true });
+    function startAdObserver() {
+      try {
+        removeKnownAds();
+        if (document.documentElement && typeof MutationObserver !== 'undefined') {
+          var observer = new MutationObserver(removeKnownAds);
+          observer.observe(document.documentElement, { childList: true, subtree: true });
+        }
+      } catch (e) {}
+    }
+    if (document.documentElement) startAdObserver();
+    else document.addEventListener('DOMContentLoaded', startAdObserver, { once: true });
   } catch (e) {}
 })();
 true;
@@ -1006,6 +1137,7 @@ export default function App() {
     const playbackStatus = useAudioPlayerStatus(player);
     const currentPageUrlRef = useRef<string>('http://10.0.2.2:8765/');
     const lastDownloadPromptRef = useRef({ url: '', at: 0 });
+    const pendingDownloadIntentRef = useRef<{ at: number; sourceUrl: string; href: string; title: string } | null>(null);
     const downloadingRef = useRef(false);
     const blobTransferRef = useRef<BlobTransfer | null>(null);
     const blobTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1269,7 +1401,7 @@ export default function App() {
         Alert.alert(
             'Скачать аудиофайл?',
             `${title}${extension ? `.${extension}` : ''}${sizeText ? ` (${sizeText})` : ''}\n\n`
-                + 'Файл создан внутри браузера. Он будет сохранён во внутреннюю папку MUSIKA Player.',
+            + 'Файл создан внутри браузера. Он будет сохранён во внутреннюю папку MUSIKA Player.',
             [
                 { text: 'Отмена', style: 'cancel' },
                 {
@@ -1422,7 +1554,14 @@ export default function App() {
         } catch (_error) {
             return;
         }
-        if (message.type === 'download') {
+        if (message.type === 'downloadIntent') {
+            pendingDownloadIntentRef.current = {
+                at: Date.now(),
+                sourceUrl: message.sourceUrl || currentPageUrlRef.current,
+                href: message.href || '',
+                title: message.title || '',
+            };
+        } else if (message.type === 'download') {
             askToDownload(message.url, message.title || '', {
                 referrer: message.referrer || currentPageUrlRef.current,
                 cookie: message.cookie || '',
@@ -1460,40 +1599,48 @@ export default function App() {
             request.isTopFrame !== false &&
             (getAudioExtension(targetUrl) || isLikelyFileDownloadUrl(targetUrl))
         ) {
+            pendingDownloadIntentRef.current = null;
             askToDownload(targetUrl, '', { referrer: currentPageUrlRef.current });
             return false;
         }
+
+        // Обычная навигация разрешена. Известные рекламные домены и прямые
+        // аудиофайлы обработаны выше; новые страницы открываем в этом WebView.
+        pendingDownloadIntentRef.current = null;
         return true;
     }
 
     function handleOpenWindow(event: WebViewOpenWindowEvent): void {
         const targetUrl = event.nativeEvent?.targetUrl || '';
-        if (!targetUrl) return;
+        // about:blank бывает временной заглушкой, которой сайт пользуется перед
+        // назначением настоящего адреса. Не показываем ложное сообщение об ошибке.
+        if (!targetUrl || /^about:blank(?:$|#)/i.test(targetUrl)) {
+            return;
+        }
 
         if (isBlockedAdUrl(targetUrl)) {
-            setNotice('Рекламное всплывающее окно заблокировано.');
+            setNotice('Рекламный переход заблокирован.');
             return;
         }
         if (/^(blob:|data:)/i.test(targetUrl)) {
-            setNotice('Сайт пытается открыть файл, созданный внутри браузера (blob). Такой тип скачивания пока не поддерживается.');
+            setNotice('Сайт пытается открыть файл, созданный внутри браузера (blob). Попробуй нажать саму ссылку скачивания ещё раз.');
             return;
         }
         if (getAudioExtension(targetUrl) || isLikelyFileDownloadUrl(targetUrl)) {
+            pendingDownloadIntentRef.current = null;
             askToDownload(targetUrl, '', { referrer: currentPageUrlRef.current });
             return;
         }
-        if (isSameSiteUrl(targetUrl, currentPageUrlRef.current)) {
-            // Раньше это окно просто блокировалось, и кнопка «Скачать» на сайте
-            // могла не срабатывать. Открываем страницу в текущей вкладке.
-            setNotice('Открываю ссылку из всплывающего окна в текущей вкладке…');
-            try {
-                webViewRef.current?.injectJavaScript(
-                    `window.location.assign(${JSON.stringify(targetUrl)}); true;`
-                );
-            } catch (_error) {}
+        if (/^https?:\/\//i.test(targetUrl)) {
+            // Резервный маршрут, если нативный WebView сообщил о новом окне раньше JS.
+            // Меняем адрес существующего WebView вместо открытия отдельного окна.
+            pendingDownloadIntentRef.current = null;
+            setNotice('');
+            setTab('browser');
+            setBrowserSourceUrl(targetUrl);
             return;
         }
-        setNotice('Всплывающее окно заблокировано. Если это нужная страница, попробуй открыть ссылку ещё раз в текущей вкладке.');
+        setNotice('Эта ссылка не поддерживается во встроенном браузере.');
     }
 
     function inspectPageAudio(): void {
@@ -1600,7 +1747,9 @@ export default function App() {
                         mediaPlaybackRequiresUserAction={false}
                         allowsInlineMediaPlayback={true}
                         onMessage={handleWebViewMessage}
+                        injectedJavaScriptBeforeContentLoaded={WEB_FILTER_SCRIPT}
                         injectedJavaScript={WEB_FILTER_SCRIPT}
+                        javaScriptCanOpenWindowsAutomatically={true}
                         onOpenWindow={handleOpenWindow}
                         onShouldStartLoadWithRequest={handleRequestNavigation}
                         {...(Platform.OS === 'ios'
@@ -1672,6 +1821,8 @@ export default function App() {
                         </TouchableOpacity>
                     </View>
                 )}
+
+
             </SafeAreaView>
         </SafeAreaProvider>
 
