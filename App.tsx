@@ -3,9 +3,9 @@ import {
     Alert,
     ActivityIndicator,
     FlatList,
+    ListRenderItemInfo,
     LogBox,
     Platform,
-    SafeAreaView,
     StatusBar,
     StyleSheet,
     Text,
@@ -14,22 +14,100 @@ import {
     View,
 } from 'react-native';
 import { WebView } from 'react-native-webview';
+import type {
+    FileDownloadEvent,
+    ShouldStartLoadRequest,
+    WebViewMessageEvent,
+    WebViewOpenWindowEvent,
+} from 'react-native-webview/lib/WebViewTypes';
 import {
     setAudioModeAsync,
     useAudioPlayer,
     useAudioPlayerStatus,
 } from 'expo-audio';
 import * as FileSystem from 'expo-file-system/legacy';
-import {SafeAreaProvider} from "react-native-safe-area-context";
+import {
+    SafeAreaProvider,
+    SafeAreaView,
+} from 'react-native-safe-area-context';
 
-const AUDIO_EXTENSIONS = ['mp3', 'm4a', 'aac', 'wav', 'ogg', 'oga', 'flac'];
+type Tab = 'browser' | 'library';
+
+interface LocalTrack {
+    id: string;
+    filename: string;
+    uri: string;
+    name: string;
+}
+
+/** Дополнительные данные о скачиваемой ссылке (приходят со страницы или из навигации). */
+interface DownloadMeta {
+    referrer?: string;
+    cookie?: string;
+    userAgent?: string;
+    mimeType?: string;
+}
+
+interface SaveDownloadedFileOptions {
+    title?: string;
+    mimeType?: string | null;
+    headers?: Record<string, unknown> | null;
+    sourceUrl?: string;
+    extension?: string;
+    contentDisposition?: string;
+}
+
+interface BlobTransfer {
+    id: string;
+    title: string;
+    mimeType: string;
+    contentDisposition: string;
+    chunks: string[];
+    received: number;
+    size: number;
+    lastPercent: number;
+}
+
+// Сообщения, которые инжектированные скрипты отправляют из WebView через postMessage.
+// Данные приходят со стороннего сайта, поэтому почти все поля необязательные,
+// а в коде они по-прежнему проверяются во время выполнения.
+type WebViewIncomingMessage =
+    | {
+        type: 'download';
+        url?: string;
+        title?: string;
+        referrer?: string;
+        cookie?: string;
+        userAgent?: string;
+        mimeType?: string;
+    }
+    | {
+        type: 'blobCandidate';
+        token?: string;
+        title?: string;
+        mimeType?: string;
+        size?: number;
+        contentDisposition?: string;
+    }
+    | { type: 'blobStart'; id: string; title?: string; mimeType?: string; size?: number }
+    | { type: 'blobChunk'; id: string; data?: unknown }
+    | { type: 'blobEnd'; id: string }
+    | { type: 'blobError'; id: string; message?: string }
+    | { type: 'notice'; message?: string };
+
+type BlobCandidateMessage = Extract<WebViewIncomingMessage, { type: 'blobCandidate' }>;
+type BlobStartMessage = Extract<WebViewIncomingMessage, { type: 'blobStart' }>;
+type BlobChunkMessage = Extract<WebViewIncomingMessage, { type: 'blobChunk' }>;
+type BlobErrorMessage = Extract<WebViewIncomingMessage, { type: 'blobError' }>;
+
+const AUDIO_EXTENSIONS: readonly string[] = ['mp3', 'm4a', 'aac', 'wav', 'ogg', 'oga', 'flac'];
 const MUSIC_DIR = `${FileSystem.documentDirectory}music/`;
 
 // blob:-ссылки WebView не умеет открывать сам, но приложение перехватывает их
 // и сохраняет файл. В dev-сборке это предупреждение закрывало бы экран.
 LogBox.ignoreLogs(["Can't open url: blob:"]);
 
-const MIME_AUDIO_EXTENSIONS = {
+const MIME_AUDIO_EXTENSIONS: Record<string, string> = {
     'audio/mpeg': 'mp3',
     'audio/mp3': 'mp3',
     'audio/x-mp3': 'mp3',
@@ -51,7 +129,7 @@ const MIME_AUDIO_EXTENSIONS = {
 
 // Известные рекламные/трекерные домены. Список можно расширить позже.
 // Не добавляй сюда основной домен сайта, иначе можешь заблокировать сам сайт.
-const BLOCKED_AD_DOMAINS = [
+const BLOCKED_AD_DOMAINS: readonly string[] = [
     'doubleclick.net',
     'googlesyndication.com',
     'googleadservices.com',
@@ -69,7 +147,7 @@ const BLOCKED_AD_DOMAINS = [
 
 // Имена последнего сегмента пути, которые обычно означают файл, а не HTML-страницу.
 // Нужны для ссылок вида /download.php?id=... и /getfile/123.
-const FILE_DOWNLOAD_SEGMENTS = [
+const FILE_DOWNLOAD_SEGMENTS: readonly string[] = [
     'download',
     'dl',
     'get',
@@ -81,7 +159,7 @@ const FILE_DOWNLOAD_SEGMENTS = [
     'download_file',
 ];
 
-function isBlockedAdUrl(rawUrl) {
+function isBlockedAdUrl(rawUrl: string): boolean {
     try {
         const parsed = new URL(rawUrl);
         const host = parsed.hostname.toLowerCase();
@@ -101,7 +179,7 @@ function isBlockedAdUrl(rawUrl) {
     }
 }
 
-function getAudioExtension(rawUrl) {
+function getAudioExtension(rawUrl: string): string {
     try {
         const parsed = new URL(rawUrl);
         const candidates = [parsed.pathname, parsed.search];
@@ -121,7 +199,7 @@ function getAudioExtension(rawUrl) {
     }
 }
 
-function getFileNameFromUrl(rawUrl) {
+function getFileNameFromUrl(rawUrl: string): string {
     try {
         const parsed = new URL(rawUrl);
         const named = ['file', 'filename', 'name', 'title', 'song', 'track']
@@ -136,7 +214,7 @@ function getFileNameFromUrl(rawUrl) {
     }
 }
 
-function makeSafeFileName(value) {
+function makeSafeFileName(value: unknown): string {
     return String(value || 'audio')
         .replace(/\.(mp3|m4a|aac|wav|ogg|oga|flac)$/i, '')
         .replace(/[\\/:*?"<>|]/g, '')
@@ -146,7 +224,7 @@ function makeSafeFileName(value) {
         .slice(0, 90) || 'audio';
 }
 
-function cleanTrackTitle(value) {
+function cleanTrackTitle(value: unknown): string {
     return String(value || '')
         .replace(/^\s*скачать\s+(?:песню|трек|музыку)?\s*/i, '')
         .replace(/\s+скачать\s+бесплатно.*$/i, '')
@@ -154,7 +232,7 @@ function cleanTrackTitle(value) {
         .trim();
 }
 
-function isGenericAudioName(value) {
+function isGenericAudioName(value: unknown): boolean {
     const normalized = String(value || '')
         .toLowerCase()
         .replace(/[^a-zа-я0-9]+/gi, '');
@@ -172,26 +250,26 @@ function isGenericAudioName(value) {
     ].includes(normalized);
 }
 
-function formatFileSize(bytes) {
+function formatFileSize(bytes: unknown): string {
     const size = Number(bytes) || 0;
     if (size < 1024) return '';
     if (size >= 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} МБ`;
     return `${Math.round(size / 1024)} КБ`;
 }
 
-function getHeaderValue(headers, name) {
+function getHeaderValue(headers: Record<string, unknown> | null | undefined, name: string): string {
     if (!headers) return '';
     const target = name.toLowerCase();
     const key = Object.keys(headers).find((header) => header.toLowerCase() === target);
     return key ? String(headers[key] || '') : '';
 }
 
-function getAudioExtensionFromMime(mimeType) {
+function getAudioExtensionFromMime(mimeType: unknown): string {
     const normalized = String(mimeType || '').split(';')[0].trim().toLowerCase();
     return MIME_AUDIO_EXTENSIONS[normalized] || '';
 }
 
-function parseContentDispositionFileName(value) {
+function parseContentDispositionFileName(value: unknown): string {
     const header = String(value || '');
     if (!header) return '';
     let filename = '';
@@ -209,7 +287,7 @@ function parseContentDispositionFileName(value) {
     return filename;
 }
 
-function getAudioExtensionFromContentDisposition(value) {
+function getAudioExtensionFromContentDisposition(value: unknown): string {
     const filename = parseContentDispositionFileName(value);
     const match = filename.match(/\.([a-z0-9]{2,5})$/i);
     if (!match) return '';
@@ -217,10 +295,10 @@ function getAudioExtensionFromContentDisposition(value) {
     return AUDIO_EXTENSIONS.includes(extension) ? extension : '';
 }
 
-function base64ToBytes(base64) {
+function base64ToBytes(base64: unknown): number[] {
     const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
     const clean = String(base64 || '').replace(/[^A-Za-z0-9+/]/g, '');
-    const bytes = [];
+    const bytes: number[] = [];
     for (let index = 0; index < clean.length; index += 4) {
         const chunk = clean.slice(index, index + 4);
         const a = alphabet.indexOf(chunk[0]);
@@ -235,7 +313,7 @@ function base64ToBytes(base64) {
     return bytes;
 }
 
-function getAudioExtensionFromBytes(bytes) {
+function getAudioExtensionFromBytes(bytes: number[] | null | undefined): string {
     if (!bytes || bytes.length < 4) return '';
     if (bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) return 'mp3';
     if (
@@ -250,7 +328,7 @@ function getAudioExtensionFromBytes(bytes) {
     return '';
 }
 
-function isLikelyWebResponse(mimeType) {
+function isLikelyWebResponse(mimeType: unknown): boolean {
     const normalized = String(mimeType || '').toLowerCase();
     return normalized.startsWith('text/')
         || normalized.includes('html')
@@ -258,12 +336,12 @@ function isLikelyWebResponse(mimeType) {
         || normalized.includes('xml');
 }
 
-function getBaseHost(host) {
+function getBaseHost(host: unknown): string {
     const parts = String(host || '').toLowerCase().split('.').filter(Boolean);
     return parts.length <= 2 ? parts.join('.') : parts.slice(-2).join('.');
 }
 
-function isSameSiteUrl(rawUrl, currentUrl) {
+function isSameSiteUrl(rawUrl: string, currentUrl: string): boolean {
     try {
         const target = new URL(rawUrl);
         const current = new URL(currentUrl);
@@ -279,7 +357,7 @@ function isSameSiteUrl(rawUrl, currentUrl) {
     }
 }
 
-function isLikelyFileDownloadUrl(rawUrl) {
+function isLikelyFileDownloadUrl(rawUrl: string): boolean {
     if (getAudioExtension(rawUrl)) return true;
     try {
         const parsed = new URL(rawUrl);
@@ -295,7 +373,7 @@ function isLikelyFileDownloadUrl(rawUrl) {
     }
 }
 
-async function ensureMusicFolder() {
+async function ensureMusicFolder(): Promise<void> {
     if (!FileSystem.documentDirectory) {
         throw new Error('Не удалось получить внутреннюю папку приложения. Перезапусти приложение.');
     }
@@ -305,8 +383,16 @@ async function ensureMusicFolder() {
     }
 }
 
-function getCurrentTime() {
+function getCurrentTime(): number {
     return Date.now();
+}
+
+function getErrorMessage(error: unknown, fallback: string): string {
+    if (typeof error === 'object' && error !== null && 'message' in error) {
+        const { message } = error as { message?: unknown };
+        if (typeof message === 'string' && message) return message;
+    }
+    return fallback;
 }
 
 // Выполняется внутри открытой страницы.
@@ -915,16 +1001,16 @@ true;
 `;
 
 export default function App() {
-    const webViewRef = useRef(null);
+    const webViewRef = useRef<WebView>(null);
     const player = useAudioPlayer(null);
     const playbackStatus = useAudioPlayerStatus(player);
-    const currentPageUrlRef = useRef('http://10.0.2.2:8765/');
+    const currentPageUrlRef = useRef<string>('http://10.0.2.2:8765/');
     const lastDownloadPromptRef = useRef({ url: '', at: 0 });
     const downloadingRef = useRef(false);
-    const blobTransferRef = useRef(null);
-    const blobTimeoutRef = useRef(null);
+    const blobTransferRef = useRef<BlobTransfer | null>(null);
+    const blobTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-    const [tab, setTab] = useState('browser');
+    const [tab, setTab] = useState<Tab>('browser');
     const [query, setQuery] = useState('');
     const [browserSourceUrl, setBrowserSourceUrl] = useState('http://10.0.2.2:8765/');
     const [canGoBack, setCanGoBack] = useState(false);
@@ -932,8 +1018,8 @@ export default function App() {
     const [notice, setNotice] = useState('Введи название песни или исполнителя. К запросу добавится «скачать бесплатно».');
     const [loadingPage, setLoadingPage] = useState(false);
     const [downloading, setDownloading] = useState(false);
-    const [localTracks, setLocalTracks] = useState([]);
-    const [currentTrack, setCurrentTrack] = useState(null);
+    const [localTracks, setLocalTracks] = useState<LocalTrack[]>([]);
+    const [currentTrack, setCurrentTrack] = useState<LocalTrack | null>(null);
 
     // useMemo сохраняет source-объект, чтобы перерисовка кнопок не перезагружала страницу.
     const webSource = useMemo(() => ({ uri: browserSourceUrl }), [browserSourceUrl]);
@@ -942,8 +1028,8 @@ export default function App() {
         try {
             await ensureMusicFolder();
             const filenames = await FileSystem.readDirectoryAsync(MUSIC_DIR);
-            const tracks = filenames
-                .filter((filename) => AUDIO_EXTENSIONS.includes(filename.split('.').pop().toLowerCase()))
+            const tracks: LocalTrack[] = filenames
+                .filter((filename) => AUDIO_EXTENSIONS.includes((filename.split('.').pop() ?? '').toLowerCase()))
                 .map((filename) => ({
                     id: filename,
                     filename,
@@ -979,7 +1065,10 @@ export default function App() {
         setNotice(`Поиск Google: ${fullQuery}`);
     }
 
-    async function saveDownloadedFile(tempUri, options = {}) {
+    async function saveDownloadedFile(
+        tempUri: string,
+        options: SaveDownloadedFileOptions = {}
+    ): Promise<string> {
         const {
             title = '',
             mimeType = '',
@@ -1046,7 +1135,7 @@ export default function App() {
         return filename;
     }
 
-    function askToDownload(rawUrl, suggestedTitle = '', meta = {}) {
+    function askToDownload(rawUrl: unknown, suggestedTitle: string = '', meta: DownloadMeta = {}): void {
         const url = String(rawUrl || '').trim();
         if (!/^https?:\/\//i.test(url)) {
             setNotice('Не удалось получить прямую HTTP(S)-ссылку на файл.');
@@ -1084,7 +1173,12 @@ export default function App() {
         );
     }
 
-    async function downloadAudio(rawUrl, title, extension, meta = {}) {
+    async function downloadAudio(
+        rawUrl: string,
+        title: string,
+        extension: string,
+        meta: DownloadMeta = {}
+    ): Promise<void> {
         if (downloadingRef.current) {
             setNotice('Другая загрузка уже идёт. Дождись её завершения.');
             return;
@@ -1096,7 +1190,7 @@ export default function App() {
             await ensureMusicFolder();
             setNotice('Скачиваю файл…');
 
-            const headers = {};
+            const headers: Record<string, string> = {};
             if (meta.referrer) headers.Referer = meta.referrer;
             if (meta.cookie) headers.Cookie = meta.cookie;
             if (meta.userAgent) headers['User-Agent'] = meta.userAgent;
@@ -1125,7 +1219,7 @@ export default function App() {
             }
             Alert.alert(
                 'Не удалось скачать файл',
-                `${error?.message || 'Ошибка загрузки.'}\n\nНекоторые сайты запрещают прямую загрузку или требуют авторизацию/cookies, которые недоступны загрузчику приложения.`
+                `${getErrorMessage(error, 'Ошибка загрузки.')}\n\nНекоторые сайты запрещают прямую загрузку или требуют авторизацию/cookies, которые недоступны загрузчику приложения.`
             );
         } finally {
             downloadingRef.current = false;
@@ -1135,14 +1229,14 @@ export default function App() {
 
     // --- Файлы, которые сайт сформировал в браузере (blob) или получил POST-запросом ---
 
-    function clearBlobTimeout() {
+    function clearBlobTimeout(): void {
         if (blobTimeoutRef.current) {
             clearTimeout(blobTimeoutRef.current);
             blobTimeoutRef.current = null;
         }
     }
 
-    function askToDownloadBlob(message) {
+    function askToDownloadBlob(message: BlobCandidateMessage): void {
         const token = String(message.token || '').trim();
         if (!token) return;
 
@@ -1191,7 +1285,12 @@ export default function App() {
         );
     }
 
-    function startBlobTransfer(token, title, mimeType, contentDisposition) {
+    function startBlobTransfer(
+        token: string,
+        title: string,
+        mimeType: string,
+        contentDisposition: string
+    ): void {
         if (downloadingRef.current) {
             setNotice('Другая загрузка уже идёт. Дождись её завершения.');
             return;
@@ -1233,14 +1332,14 @@ export default function App() {
         }
     }
 
-    function handleBlobStart(message) {
+    function handleBlobStart(message: BlobStartMessage): void {
         const transfer = blobTransferRef.current;
         if (!transfer || transfer.id !== message.id) return;
         transfer.mimeType = message.mimeType || transfer.mimeType;
         transfer.size = Number(message.size) || transfer.size;
     }
 
-    function handleBlobChunk(message) {
+    function handleBlobChunk(message: BlobChunkMessage): void {
         const transfer = blobTransferRef.current;
         if (!transfer || transfer.id !== message.id) return;
         const data = typeof message.data === 'string' ? message.data : '';
@@ -1269,7 +1368,7 @@ export default function App() {
         }
     }
 
-    async function finishBlobTransfer(id) {
+    async function finishBlobTransfer(id: string): Promise<void> {
         const transfer = blobTransferRef.current;
         if (!transfer || transfer.id !== id) return;
         blobTransferRef.current = null;
@@ -1295,7 +1394,7 @@ export default function App() {
             } catch (_cleanupError) {}
             Alert.alert(
                 'Не удалось сохранить файл',
-                error?.message || 'Браузер передал повреждённый файл.'
+                getErrorMessage(error, 'Браузер передал повреждённый файл.')
             );
         } finally {
             downloadingRef.current = false;
@@ -1303,7 +1402,7 @@ export default function App() {
         }
     }
 
-    function handleBlobError(message) {
+    function handleBlobError(message: BlobErrorMessage): void {
         const transfer = blobTransferRef.current;
         if (!transfer || transfer.id !== message.id) return;
         blobTransferRef.current = null;
@@ -1316,8 +1415,8 @@ export default function App() {
         );
     }
 
-    function handleWebViewMessage(event) {
-        let message;
+    function handleWebViewMessage(event: WebViewMessageEvent): void {
+        let message: WebViewIncomingMessage;
         try {
             message = JSON.parse(event.nativeEvent.data);
         } catch (_error) {
@@ -1345,7 +1444,7 @@ export default function App() {
         }
     }
 
-    function handleRequestNavigation(request) {
+    function handleRequestNavigation(request: ShouldStartLoadRequest): boolean {
         const targetUrl = request.url || '';
         if (isBlockedAdUrl(targetUrl)) {
             setNotice('Рекламный переход заблокирован.');
@@ -1367,7 +1466,7 @@ export default function App() {
         return true;
     }
 
-    function handleOpenWindow(event) {
+    function handleOpenWindow(event: WebViewOpenWindowEvent): void {
         const targetUrl = event.nativeEvent?.targetUrl || '';
         if (!targetUrl) return;
 
@@ -1397,13 +1496,13 @@ export default function App() {
         setNotice('Всплывающее окно заблокировано. Если это нужная страница, попробуй открыть ссылку ещё раз в текущей вкладке.');
     }
 
-    function inspectPageAudio() {
+    function inspectPageAudio(): void {
         if (webViewRef.current) {
             webViewRef.current.injectJavaScript(INSPECT_PAGE_AUDIO_SCRIPT);
         }
     }
 
-    function playLocalTrack(track) {
+    function playLocalTrack(track: LocalTrack): void {
         if (currentTrack?.id === track.id) {
             if (playbackStatus.playing) player.pause();
             else player.play();
@@ -1419,11 +1518,11 @@ export default function App() {
             player.replace(track.uri);
             player.play();
         } catch (error) {
-            Alert.alert('Ошибка плеера', error?.message || 'Не получилось запустить этот файл.');
+            Alert.alert('Ошибка плеера', getErrorMessage(error, 'Не получилось запустить этот файл.'));
         }
     }
 
-    function renderLocalTrack({ item }) {
+    function renderLocalTrack({ item }: ListRenderItemInfo<LocalTrack>) {
         const isCurrent = currentTrack?.id === item.id;
         return (
             <View style={styles.trackCard}>
@@ -1506,7 +1605,7 @@ export default function App() {
                         onShouldStartLoadWithRequest={handleRequestNavigation}
                         {...(Platform.OS === 'ios'
                             ? {
-                                onFileDownload: (event) => {
+                                onFileDownload: (event: FileDownloadEvent) => {
                                     const targetUrl = event.nativeEvent?.downloadUrl || '';
                                     if (targetUrl) {
                                         askToDownload(targetUrl, '', {
