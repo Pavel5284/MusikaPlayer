@@ -7,6 +7,7 @@ import {
     LogBox,
     Platform,
     StatusBar,
+    useWindowDimensions,
     StyleSheet,
     Text,
     TextInput,
@@ -1085,43 +1086,6 @@ const WEB_FILTER_SCRIPT = `
 true;
 `;
 
-const INSPECT_PAGE_AUDIO_SCRIPT = `
-(function () {
-  var audioRe = /\\.(mp3|m4a|aac|wav|ogg|oga|flac)(?:[?#]|$)/i;
-  var urls = [];
-  function add(url) {
-    if (url && urls.indexOf(url) === -1) urls.push(url);
-  }
-  Array.from(document.querySelectorAll('audio, audio source')).forEach(function (item) {
-    add(item.currentSrc || item.src || item.getAttribute('src') || '');
-  });
-  Array.from(document.querySelectorAll('a[href]')).forEach(function (item) {
-    var href = item.href;
-    if (href && audioRe.test(href)) add(href);
-  });
-  try {
-    performance.getEntriesByType('resource').forEach(function (entry) {
-      if (entry && entry.name) add(entry.name);
-    });
-  } catch (e) {}
-  var url = urls.find(function (item) { return audioRe.test(item); });
-  var cookie = '';
-  try { cookie = document.cookie || ''; } catch (e) {}
-  window.ReactNativeWebView.postMessage(JSON.stringify(
-    url ? {
-      type: 'download',
-      url: url,
-      title: document.title || '',
-      referrer: location.href,
-      cookie: cookie,
-      userAgent: navigator.userAgent || ''
-    } :
-      { type: 'notice', message: 'Не удалось обнаружить прямую ссылку на аудиофайл в этой странице. Попробуй нажать именно ссылку на MP3 или страницу с HTML5-аудиоплеером.' }
-  ));
-})();
-true;
-`;
-
 const PAUSE_PAGE_AUDIO_SCRIPT = `
 (function () {
   document.querySelectorAll('audio, video').forEach(function (element) {
@@ -1133,9 +1097,17 @@ true;
 
 export default function App() {
     const webViewRef = useRef<WebView>(null);
+    const topGestureStartY = useRef<number | null>(null);
+    const { width: windowWidth, height: windowHeight } = useWindowDimensions();
+    const isLandscape = windowWidth > windowHeight;
+    const [landscapeHeaderVisible, setLandscapeHeaderVisible] = useState(true);
+
+    useEffect(() => {
+        setLandscapeHeaderVisible(!isLandscape);
+    }, [isLandscape]);
     const player = useAudioPlayer(null);
     const playbackStatus = useAudioPlayerStatus(player);
-    const currentPageUrlRef = useRef<string>('http://10.0.2.2:8765/');
+    const currentPageUrlRef = useRef<string>('https://www.google.com/');
     const lastDownloadPromptRef = useRef({ url: '', at: 0 });
     const pendingDownloadIntentRef = useRef<{ at: number; sourceUrl: string; href: string; title: string } | null>(null);
     const downloadingRef = useRef(false);
@@ -1144,17 +1116,28 @@ export default function App() {
 
     const [tab, setTab] = useState<Tab>('browser');
     const [query, setQuery] = useState('');
-    const [browserSourceUrl, setBrowserSourceUrl] = useState('http://10.0.2.2:8765/');
+    const [browserSourceUrl, setBrowserSourceUrl] = useState('https://www.google.com/');
     const [canGoBack, setCanGoBack] = useState(false);
     const [pageTitle, setPageTitle] = useState('Musika Download Test');
     const [notice, setNotice] = useState('Введи название песни или исполнителя. К запросу добавится «скачать бесплатно».');
     const [loadingPage, setLoadingPage] = useState(false);
     const [downloading, setDownloading] = useState(false);
     const [localTracks, setLocalTracks] = useState<LocalTrack[]>([]);
+    const [libraryQuery, setLibraryQuery] = useState('');
     const [currentTrack, setCurrentTrack] = useState<LocalTrack | null>(null);
 
     // useMemo сохраняет source-объект, чтобы перерисовка кнопок не перезагружала страницу.
     const webSource = useMemo(() => ({ uri: browserSourceUrl }), [browserSourceUrl]);
+
+    // Фильтруем только уже скачанные файлы. Поиск работает по мере ввода.
+    const filteredTracks = useMemo(() => {
+        const search = libraryQuery.trim().toLocaleLowerCase();
+        if (!search) return localTracks;
+
+        return localTracks.filter((track) =>
+            `${track.name} ${track.filename}`.toLocaleLowerCase().includes(search)
+        );
+    }, [localTracks, libraryQuery]);
 
     const loadLocalTracks = useCallback(async () => {
         try {
@@ -1643,12 +1626,6 @@ export default function App() {
         setNotice('Эта ссылка не поддерживается во встроенном браузере.');
     }
 
-    function inspectPageAudio(): void {
-        if (webViewRef.current) {
-            webViewRef.current.injectJavaScript(INSPECT_PAGE_AUDIO_SCRIPT);
-        }
-    }
-
     function playLocalTrack(track: LocalTrack): void {
         if (currentTrack?.id === track.id) {
             if (playbackStatus.playing) player.pause();
@@ -1688,55 +1665,75 @@ export default function App() {
         <SafeAreaProvider>
             <SafeAreaView style={styles.safeArea}>
                 <StatusBar barStyle="light-content" backgroundColor="#0A0E18" />
-                <View style={styles.header}>
-                    <View>
-                        <Text style={styles.logo}>MUSIKA</Text>
-                        <Text style={styles.subtitle}>BROWSER · PLAYER</Text>
-                    </View>
-                    <View style={styles.headerDot} />
-                </View>
+                {(!isLandscape || landscapeHeaderVisible) && (
+                    <>
+                        <View style={styles.header}>
+                            <View>
+                                <Text style={styles.logo}>MUSIKA</Text>
+                                <Text style={styles.subtitle}>BROWSER · PLAYER</Text>
+                            </View>
+                            <View style={styles.headerDot} />
+                        </View>
 
-                <View style={styles.tabs}>
-                    <TouchableOpacity style={[styles.tab, tab === 'browser' && styles.tabActive]} onPress={() => setTab('browser')}>
-                        <Text style={[styles.tabText, tab === 'browser' && styles.tabTextActive]}>Поиск / браузер</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity style={[styles.tab, tab === 'library' && styles.tabActive]} onPress={() => { setTab('library'); loadLocalTracks(); }}>
-                        <Text style={[styles.tabText, tab === 'library' && styles.tabTextActive]}>Моя музыка ({localTracks.length})</Text>
-                    </TouchableOpacity>
-                </View>
+                        <View style={styles.tabs}>
+                            <TouchableOpacity style={[styles.tab, tab === 'browser' && styles.tabActive]} onPress={() => setTab('browser')}>
+                                <Text style={[styles.tabText, tab === 'browser' && styles.tabTextActive]}>Поиск / браузер</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity style={[styles.tab, tab === 'library' && styles.tabActive]} onPress={() => { setTab('library'); loadLocalTracks(); }}>
+                                <Text style={[styles.tabText, tab === 'library' && styles.tabTextActive]}>Моя музыка ({localTracks.length})</Text>
+                            </TouchableOpacity>
+                        </View>
+                    </>
+                )}
+
+                {isLandscape && !landscapeHeaderVisible && (
+                    <View
+                        style={styles.landscapeHandleArea}
+                        onTouchStart={(event) => { topGestureStartY.current = event.nativeEvent.pageY; }}
+                        onTouchEnd={(event) => {
+                            const startY = topGestureStartY.current;
+                            topGestureStartY.current = null;
+                            if (startY !== null && event.nativeEvent.pageY - startY > 18) setLandscapeHeaderVisible(true);
+                        }}
+                    >
+                        <TouchableOpacity style={styles.landscapeHandle} onPress={() => setLandscapeHeaderVisible(true)}>
+                            <Text style={styles.landscapeHandleText}>⌄</Text>
+                        </TouchableOpacity>
+                    </View>
+                )}
 
                 <View style={[styles.panel, { display: tab === 'browser' ? 'flex' : 'none' }]}>
-                    <View style={styles.searchRow}>
-                        <TextInput
-                            style={styles.searchInput}
-                            value={query}
-                            onChangeText={setQuery}
-                            placeholder="Название песни или исполнитель"
-                            placeholderTextColor="#7C879D"
-                            returnKeyType="search"
-                            onSubmitEditing={handleSearch}
-                            autoCapitalize="none"
-                            autoCorrect={false}
-                        />
-                        <TouchableOpacity style={styles.searchButton} onPress={handleSearch}>
-                            <Text style={styles.searchButtonText}>НАЙТИ</Text>
-                        </TouchableOpacity>
-                    </View>
+                    {(!isLandscape || landscapeHeaderVisible) && <>
+                        {isLandscape && <TouchableOpacity style={styles.landscapeCollapse} onPress={() => setLandscapeHeaderVisible(false)}><Text style={styles.landscapeHandleText}>⌃</Text></TouchableOpacity>}
+                        <View style={styles.searchRow}>
+                            <TextInput
+                                style={styles.searchInput}
+                                value={query}
+                                onChangeText={setQuery}
+                                placeholder="Название песни или исполнитель"
+                                placeholderTextColor="#7C879D"
+                                returnKeyType="search"
+                                onSubmitEditing={handleSearch}
+                                autoCapitalize="none"
+                                autoCorrect={false}
+                            />
+                            <TouchableOpacity style={styles.searchButton} onPress={handleSearch}>
+                                <Text style={styles.searchButtonText}>НАЙТИ</Text>
+                            </TouchableOpacity>
+                        </View>
 
-                    <View style={styles.browserToolbar}>
-                        <TouchableOpacity style={[styles.smallButton, !canGoBack && styles.disabledButton]} disabled={!canGoBack} onPress={() => webViewRef.current?.goBack()}>
-                            <Text style={styles.smallButtonText}>‹ Назад</Text>
-                        </TouchableOpacity>
-                        <TouchableOpacity style={styles.smallButton} onPress={() => webViewRef.current?.reload()}>
-                            <Text style={styles.smallButtonText}>↻ Обновить</Text>
-                        </TouchableOpacity>
-                        <TouchableOpacity style={[styles.smallButton, styles.downloadPageButton]} onPress={inspectPageAudio} disabled={downloading}>
-                            <Text style={styles.downloadPageText}>{downloading ? 'Загрузка…' : 'Найти аудио'}</Text>
-                        </TouchableOpacity>
-                    </View>
+                        <View style={styles.browserToolbar}>
+                            <TouchableOpacity style={[styles.smallButton, !canGoBack && styles.disabledButton]} disabled={!canGoBack} onPress={() => webViewRef.current?.goBack()}>
+                                <Text style={styles.smallButtonText}>‹ Назад</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity style={styles.smallButton} onPress={() => webViewRef.current?.reload()}>
+                                <Text style={styles.smallButtonText}>↻ Обновить</Text>
+                            </TouchableOpacity>
+                        </View>
 
-                    <Text style={styles.pageTitle} numberOfLines={1}>{pageTitle || 'Браузер'}</Text>
-                    {loadingPage && <ActivityIndicator size="small" color="#B9F56D" style={styles.spinner} />}
+                        <Text style={styles.pageTitle} numberOfLines={1}>{pageTitle || 'Браузер'}</Text>
+                        {loadingPage && <ActivityIndicator size="small" color="#B9F56D" style={styles.spinner} />}
+                    </>}
                     <WebView
                         ref={webViewRef}
                         style={styles.webView}
@@ -1795,17 +1792,34 @@ export default function App() {
                             <Text style={styles.smallButtonText}>↻ Обновить</Text>
                         </TouchableOpacity>
                     </View>
+                    <TextInput
+                        style={styles.librarySearchInput}
+                        value={libraryQuery}
+                        onChangeText={setLibraryQuery}
+                        placeholder="Поиск по песням и исполнителям"
+                        placeholderTextColor="#7C879D"
+                        returnKeyType="search"
+                        autoCapitalize="none"
+                        autoCorrect={false}
+                        clearButtonMode="while-editing"
+                    />
                     {localTracks.length === 0 ? (
                         <View style={styles.emptyState}>
                             <Text style={styles.emptyTitle}>Пока здесь пусто</Text>
                             <Text style={styles.emptyText}>Открой «Поиск / браузер», найди прямую ссылку на разрешённый аудиофайл и скачай его.</Text>
                         </View>
+                    ) : filteredTracks.length === 0 ? (
+                        <View style={styles.emptyState}>
+                            <Text style={styles.emptyTitle}>Ничего не найдено</Text>
+                            <Text style={styles.emptyText}>Попробуй изменить запрос или очистить строку поиска.</Text>
+                        </View>
                     ) : (
                         <FlatList
-                            data={localTracks}
+                            data={filteredTracks}
                             keyExtractor={(item) => item.id}
                             renderItem={renderLocalTrack}
                             contentContainerStyle={styles.listContent}
+                            keyboardShouldPersistTaps="handled"
                         />
                     )}
                 </View>
@@ -1831,6 +1845,10 @@ export default function App() {
 
 const styles = StyleSheet.create({
     safeArea: { flex: 1, backgroundColor: '#0A0E18' },
+    landscapeHandleArea: { position: 'absolute', top: 0, left: 0, right: 0, height: 34, zIndex: 20, alignItems: 'center', justifyContent: 'flex-start' },
+    landscapeHandle: { width: 64, height: 24, borderBottomLeftRadius: 12, borderBottomRightRadius: 12, backgroundColor: '#151B2B', alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#283149' },
+    landscapeCollapse: { alignSelf: 'center', width: 48, height: 22, alignItems: 'center', justifyContent: 'center', marginBottom: 2 },
+    landscapeHandleText: { color: '#B9F56D', fontSize: 18, fontWeight: '900', lineHeight: 20 },
     header: { paddingHorizontal: 18, paddingTop: 10, paddingBottom: 12, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
     logo: { color: '#F4F6FC', fontSize: 27, fontWeight: '900', letterSpacing: 3 },
     subtitle: { color: '#8792A9', marginTop: 2, fontSize: 10, letterSpacing: 1.2 },
@@ -1849,14 +1867,13 @@ const styles = StyleSheet.create({
     smallButton: { borderRadius: 9, backgroundColor: '#242D42', paddingHorizontal: 10, paddingVertical: 8, alignItems: 'center', justifyContent: 'center' },
     smallButtonText: { color: '#DCE3F2', fontSize: 11, fontWeight: '700' },
     disabledButton: { opacity: 0.35 },
-    downloadPageButton: { backgroundColor: '#B9F56D', flex: 1 },
-    downloadPageText: { color: '#111827', fontSize: 11, fontWeight: '900' },
     pageTitle: { color: '#8994A8', fontSize: 10, marginBottom: 5 },
     spinner: { position: 'absolute', right: 20, top: 86, zIndex: 2 },
     webView: { flex: 1, backgroundColor: '#FFFFFF', borderRadius: 10, overflow: 'hidden' },
     notice: { color: '#8D98AE', fontSize: 10, lineHeight: 14, paddingTop: 5, paddingBottom: 2 },
     libraryHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 },
     libraryHeadingWrap: { flex: 1, paddingRight: 10 },
+    librarySearchInput: { backgroundColor: '#151B2B', borderRadius: 11, color: '#F4F6FC', paddingHorizontal: 12, paddingVertical: 11, borderWidth: 1, borderColor: '#283149', fontSize: 13, marginBottom: 12 },
     sectionTitle: { color: '#F4F6FC', fontSize: 22, fontWeight: '900' },
     sectionHint: { color: '#8792A9', marginTop: 4, fontSize: 11, lineHeight: 15 },
     listContent: { paddingBottom: 12 },
