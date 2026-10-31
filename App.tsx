@@ -2,10 +2,15 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
     Alert,
     ActivityIndicator,
+    Animated,
+    Easing,
     FlatList,
+    Keyboard,
     ListRenderItemInfo,
     LogBox,
+    PanResponder,
     Platform,
+    ScrollView,
     StatusBar,
     useWindowDimensions,
     StyleSheet,
@@ -376,6 +381,17 @@ async function ensureMusicFolder(): Promise<void> {
     if (!info.exists) {
         await FileSystem.makeDirectoryAsync(MUSIC_DIR, { intermediates: true });
     }
+}
+
+function clamp01(value: number): number {
+    return Math.min(1, Math.max(0, value));
+}
+
+/** Решаем, куда довести панель после жеста: по скорости или по тому, где её отпустили. */
+function shouldOpenDrawer(progress: number, velocityX: number): boolean {
+    if (velocityX > 0.4) return true;
+    if (velocityX < -0.4) return false;
+    return progress > 0.5;
 }
 
 function getCurrentTime(): number {
@@ -1097,14 +1113,84 @@ true;
 
 export default function App() {
     const webViewRef = useRef<WebView>(null);
-    const topGestureStartY = useRef<number | null>(null);
     const { width: windowWidth, height: windowHeight } = useWindowDimensions();
     const isLandscape = windowWidth > windowHeight;
-    const [landscapeHeaderVisible, setLandscapeHeaderVisible] = useState(true);
+
+    // Выезжающая панель с поиском (только в альбомной ориентации).
+    // drawerProgress: 0 — спрятана за левым краем, 1 — полностью выдвинута.
+    const drawerWidth = Math.round(Math.min(400, windowWidth * 0.6));
+    const drawerWidthRef = useRef(drawerWidth);
+    const [drawerProgress] = useState(() => new Animated.Value(0));
+    const drawerOpenRef = useRef(false);
+    const drawerDragStart = useRef(0);
+    const [drawerOpen, setDrawerOpen] = useState(false);
 
     useEffect(() => {
-        setLandscapeHeaderVisible(!isLandscape);
-    }, [isLandscape]);
+        drawerWidthRef.current = drawerWidth;
+    }, [drawerWidth]);
+
+    // Плавно довести панель до открытого/закрытого состояния.
+    const settleDrawer = useCallback((open: boolean) => {
+        drawerOpenRef.current = open;
+        setDrawerOpen(open);
+        if (!open) Keyboard.dismiss();
+        Animated.timing(drawerProgress, {
+            toValue: open ? 1 : 0,
+            duration: 200,
+            easing: Easing.out(Easing.cubic),
+            useNativeDriver: true,
+        }).start();
+    }, [drawerProgress]);
+
+    // При повороте экрана панель всегда стартует закрытой.
+    const [prevIsLandscape, setPrevIsLandscape] = useState(isLandscape);
+    if (prevIsLandscape !== isLandscape) {
+        setPrevIsLandscape(isLandscape);
+        setDrawerOpen(false);
+    }
+    useEffect(() => {
+        drawerProgress.stopAnimation();
+        drawerProgress.setValue(0);
+        drawerOpenRef.current = false;
+    }, [isLandscape, drawerProgress]);
+
+    const drawerResponders = useMemo(() => {
+        // Общая часть: панель следует за пальцем, а при отпускании доезжает до края.
+        const dragHandlers = {
+            onPanResponderGrant: () => {
+                drawerProgress.stopAnimation();
+                drawerDragStart.current = drawerOpenRef.current ? 1 : 0;
+            },
+            onPanResponderMove: (_event: unknown, gesture: { dx: number }) => {
+                drawerProgress.setValue(clamp01(drawerDragStart.current + gesture.dx / drawerWidthRef.current));
+            },
+            onPanResponderRelease: (_event: unknown, gesture: { dx: number; vx: number }) => {
+                const progress = clamp01(drawerDragStart.current + gesture.dx / drawerWidthRef.current);
+                settleDrawer(shouldOpenDrawer(progress, gesture.vx));
+            },
+            onPanResponderTerminate: () => settleDrawer(drawerOpenRef.current),
+        };
+
+        return {
+            // Свайп вправо по виджету или по левому краю — выдвигает панель.
+            // eslint-disable-next-line react-hooks/refs -- refs читаются только в обработчиках жестов, не во время рендера
+            open: PanResponder.create({
+                onMoveShouldSetPanResponder: (_event, gesture) =>
+                    gesture.dx > 8 && gesture.dx > Math.abs(gesture.dy) * 1.5,
+                ...dragHandlers,
+            }),
+            // Свайп влево по панели или по затемнению — задвигает её.
+            // Capture нужен, чтобы жест не перехватывали кнопки, поля ввода и ScrollView внутри панели.
+            // eslint-disable-next-line react-hooks/refs -- refs читаются только в обработчиках жестов, не во время рендера
+            close: PanResponder.create({
+                onMoveShouldSetPanResponderCapture: (_event, gesture) =>
+                    gesture.dx < -8 && -gesture.dx > Math.abs(gesture.dy) * 1.5,
+                onPanResponderTerminationRequest: () => false,
+                ...dragHandlers,
+            }),
+        };
+    }, [drawerProgress, settleDrawer]);
+
     const player = useAudioPlayer(null);
     const playbackStatus = useAudioPlayerStatus(player);
     const currentPageUrlRef = useRef<string>('https://www.google.com/');
@@ -1178,6 +1264,13 @@ export default function App() {
         setBrowserSourceUrl(url);
         setTab('browser');
         setNotice(`Поиск Google: ${fullQuery}`);
+        if (isLandscape) settleDrawer(false);
+    }
+
+    function selectTab(next: Tab) {
+        setTab(next);
+        if (next === 'library') loadLocalTracks();
+        if (isLandscape) settleDrawer(false);
     }
 
     async function saveDownloadedFile(
@@ -1661,166 +1754,224 @@ export default function App() {
         );
     }
 
+
+    // Шапка с логотипом и вкладки. В портрете стоят сверху, в альбоме живут внутри выезжающей панели.
+    const headerBlock = (
+        <>
+            <View style={styles.header}>
+                <View>
+                    <Text style={styles.logo}>MUSIKA</Text>
+                    <Text style={styles.subtitle}>BROWSER · PLAYER</Text>
+                </View>
+                <View style={styles.headerDot} />
+            </View>
+
+            <View style={styles.tabs}>
+                <TouchableOpacity style={[styles.tab, tab === 'browser' && styles.tabActive]} onPress={() => selectTab('browser')}>
+                    <Text style={[styles.tabText, tab === 'browser' && styles.tabTextActive]}>Поиск / браузер</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={[styles.tab, tab === 'library' && styles.tabActive]} onPress={() => selectTab('library')}>
+                    <Text style={[styles.tabText, tab === 'library' && styles.tabTextActive]}>Моя музыка ({localTracks.length})</Text>
+                </TouchableOpacity>
+            </View>
+        </>
+    );
+
+    // Строка поиска и кнопки браузера: тоже либо в панели браузера (портрет), либо в выезжающей панели (альбом).
+    const searchControls = (
+        <>
+            <View style={styles.searchRow}>
+                <TextInput
+                    style={styles.searchInput}
+                    value={query}
+                    onChangeText={setQuery}
+                    placeholder="Название песни или исполнитель"
+                    placeholderTextColor="#7C879D"
+                    returnKeyType="search"
+                    onSubmitEditing={handleSearch}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                />
+                <TouchableOpacity style={styles.searchButton} onPress={handleSearch}>
+                    <Text style={styles.searchButtonText}>НАЙТИ</Text>
+                </TouchableOpacity>
+            </View>
+
+            <View style={styles.browserToolbar}>
+                <TouchableOpacity style={[styles.smallButton, !canGoBack && styles.disabledButton]} disabled={!canGoBack} onPress={() => webViewRef.current?.goBack()}>
+                    <Text style={styles.smallButtonText}>‹ Назад</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.smallButton} onPress={() => webViewRef.current?.reload()}>
+                    <Text style={styles.smallButtonText}>↻ Обновить</Text>
+                </TouchableOpacity>
+            </View>
+        </>
+    );
+
+    const pageTitleText = <Text style={styles.pageTitle} numberOfLines={1}>{pageTitle || 'Браузер'}</Text>;
+
     return (
         <SafeAreaProvider>
             <SafeAreaView style={styles.safeArea}>
                 <StatusBar barStyle="light-content" backgroundColor="#0A0E18" />
-                {(!isLandscape || landscapeHeaderVisible) && (
-                    <>
-                        <View style={styles.header}>
-                            <View>
-                                <Text style={styles.logo}>MUSIKA</Text>
-                                <Text style={styles.subtitle}>BROWSER · PLAYER</Text>
-                            </View>
-                            <View style={styles.headerDot} />
-                        </View>
+                {!isLandscape && headerBlock}
 
-                        <View style={styles.tabs}>
-                            <TouchableOpacity style={[styles.tab, tab === 'browser' && styles.tabActive]} onPress={() => setTab('browser')}>
-                                <Text style={[styles.tabText, tab === 'browser' && styles.tabTextActive]}>Поиск / браузер</Text>
-                            </TouchableOpacity>
-                            <TouchableOpacity style={[styles.tab, tab === 'library' && styles.tabActive]} onPress={() => { setTab('library'); loadLocalTracks(); }}>
-                                <Text style={[styles.tabText, tab === 'library' && styles.tabTextActive]}>Моя музыка ({localTracks.length})</Text>
-                            </TouchableOpacity>
-                        </View>
-                    </>
-                )}
-
-                {isLandscape && !landscapeHeaderVisible && (
-                    <View
-                        style={styles.landscapeHandleArea}
-                        onTouchStart={(event) => { topGestureStartY.current = event.nativeEvent.pageY; }}
-                        onTouchEnd={(event) => {
-                            const startY = topGestureStartY.current;
-                            topGestureStartY.current = null;
-                            if (startY !== null && event.nativeEvent.pageY - startY > 18) setLandscapeHeaderVisible(true);
-                        }}
-                    >
-                        <TouchableOpacity style={styles.landscapeHandle} onPress={() => setLandscapeHeaderVisible(true)}>
-                            <Text style={styles.landscapeHandleText}>⌄</Text>
-                        </TouchableOpacity>
+                <View style={styles.content}>
+                    <View style={[styles.panel, { display: tab === 'browser' ? 'flex' : 'none' }]}>
+                        {!isLandscape && (
+                            <>
+                                {searchControls}
+                                {pageTitleText}
+                                {loadingPage && <ActivityIndicator size="small" color="#B9F56D" style={styles.spinner} />}
+                            </>
+                        )}
+                        <WebView
+                            ref={webViewRef}
+                            style={styles.webView}
+                            source={webSource}
+                            javaScriptEnabled={true}
+                            domStorageEnabled={true}
+                            webviewDebuggingEnabled={true}
+                            mediaPlaybackRequiresUserAction={false}
+                            allowsInlineMediaPlayback={true}
+                            onMessage={handleWebViewMessage}
+                            injectedJavaScriptBeforeContentLoaded={WEB_FILTER_SCRIPT}
+                            injectedJavaScript={WEB_FILTER_SCRIPT}
+                            javaScriptCanOpenWindowsAutomatically={true}
+                            onOpenWindow={handleOpenWindow}
+                            onShouldStartLoadWithRequest={handleRequestNavigation}
+                            {...(Platform.OS === 'ios'
+                                ? {
+                                    onFileDownload: (event: FileDownloadEvent) => {
+                                        const targetUrl = event.nativeEvent?.downloadUrl || '';
+                                        if (targetUrl) {
+                                            askToDownload(targetUrl, '', {
+                                                referrer: currentPageUrlRef.current,
+                                            });
+                                        }
+                                    },
+                                }
+                                : {})}
+                            onNavigationStateChange={(navState) => {
+                                if (navState.url) currentPageUrlRef.current = navState.url;
+                                setCanGoBack(Boolean(navState.canGoBack));
+                                setPageTitle(navState.title || navState.url || 'Браузер');
+                            }}
+                            onLoadStart={() => setLoadingPage(true)}
+                            onLoadEnd={() => setLoadingPage(false)}
+                            onError={() => {
+                                setLoadingPage(false);
+                                setNotice('Не удалось открыть страницу. Проверь интернет или попробуй обновить её.');
+                            }}
+                            onHttpError={(event) => {
+                                const status = event.nativeEvent?.statusCode;
+                                if (status >= 400) setNotice(`Страница вернула HTTP ${status}. Сайт мог ограничить встроенный браузер.`);
+                            }}
+                            setSupportMultipleWindows={true}
+                            originWhitelist={['http://*', 'https://*']}
+                        />
+                        <Text style={styles.notice} numberOfLines={3}>{notice}</Text>
                     </View>
-                )}
 
-                <View style={[styles.panel, { display: tab === 'browser' ? 'flex' : 'none' }]}>
-                    {(!isLandscape || landscapeHeaderVisible) && <>
-                        {isLandscape && <TouchableOpacity style={styles.landscapeCollapse} onPress={() => setLandscapeHeaderVisible(false)}><Text style={styles.landscapeHandleText}>⌃</Text></TouchableOpacity>}
-                        <View style={styles.searchRow}>
-                            <TextInput
-                                style={styles.searchInput}
-                                value={query}
-                                onChangeText={setQuery}
-                                placeholder="Название песни или исполнитель"
-                                placeholderTextColor="#7C879D"
-                                returnKeyType="search"
-                                onSubmitEditing={handleSearch}
-                                autoCapitalize="none"
-                                autoCorrect={false}
-                            />
-                            <TouchableOpacity style={styles.searchButton} onPress={handleSearch}>
-                                <Text style={styles.searchButtonText}>НАЙТИ</Text>
-                            </TouchableOpacity>
-                        </View>
-
-                        <View style={styles.browserToolbar}>
-                            <TouchableOpacity style={[styles.smallButton, !canGoBack && styles.disabledButton]} disabled={!canGoBack} onPress={() => webViewRef.current?.goBack()}>
-                                <Text style={styles.smallButtonText}>‹ Назад</Text>
-                            </TouchableOpacity>
-                            <TouchableOpacity style={styles.smallButton} onPress={() => webViewRef.current?.reload()}>
+                    <View style={[styles.panel, { display: tab === 'library' ? 'flex' : 'none' }]}>
+                        <View style={styles.libraryHeader}>
+                            <View style={styles.libraryHeadingWrap}>
+                                <Text style={styles.sectionTitle}>Моя музыка</Text>
+                                <Text style={styles.sectionHint}>Скачанные аудиофайлы из папки приложения</Text>
+                            </View>
+                            <TouchableOpacity style={styles.smallButton} onPress={loadLocalTracks}>
                                 <Text style={styles.smallButtonText}>↻ Обновить</Text>
                             </TouchableOpacity>
                         </View>
-
-                        <Text style={styles.pageTitle} numberOfLines={1}>{pageTitle || 'Браузер'}</Text>
-                        {loadingPage && <ActivityIndicator size="small" color="#B9F56D" style={styles.spinner} />}
-                    </>}
-                    <WebView
-                        ref={webViewRef}
-                        style={styles.webView}
-                        source={webSource}
-                        javaScriptEnabled={true}
-                        domStorageEnabled={true}
-                        webviewDebuggingEnabled={true}
-                        mediaPlaybackRequiresUserAction={false}
-                        allowsInlineMediaPlayback={true}
-                        onMessage={handleWebViewMessage}
-                        injectedJavaScriptBeforeContentLoaded={WEB_FILTER_SCRIPT}
-                        injectedJavaScript={WEB_FILTER_SCRIPT}
-                        javaScriptCanOpenWindowsAutomatically={true}
-                        onOpenWindow={handleOpenWindow}
-                        onShouldStartLoadWithRequest={handleRequestNavigation}
-                        {...(Platform.OS === 'ios'
-                            ? {
-                                onFileDownload: (event: FileDownloadEvent) => {
-                                    const targetUrl = event.nativeEvent?.downloadUrl || '';
-                                    if (targetUrl) {
-                                        askToDownload(targetUrl, '', {
-                                            referrer: currentPageUrlRef.current,
-                                        });
-                                    }
-                                },
-                            }
-                            : {})}
-                        onNavigationStateChange={(navState) => {
-                            if (navState.url) currentPageUrlRef.current = navState.url;
-                            setCanGoBack(Boolean(navState.canGoBack));
-                            setPageTitle(navState.title || navState.url || 'Браузер');
-                        }}
-                        onLoadStart={() => setLoadingPage(true)}
-                        onLoadEnd={() => setLoadingPage(false)}
-                        onError={() => {
-                            setLoadingPage(false);
-                            setNotice('Не удалось открыть страницу. Проверь интернет или попробуй обновить её.');
-                        }}
-                        onHttpError={(event) => {
-                            const status = event.nativeEvent?.statusCode;
-                            if (status >= 400) setNotice(`Страница вернула HTTP ${status}. Сайт мог ограничить встроенный браузер.`);
-                        }}
-                        setSupportMultipleWindows={true}
-                        originWhitelist={['http://*', 'https://*']}
-                    />
-                    <Text style={styles.notice} numberOfLines={3}>{notice}</Text>
-                </View>
-
-                <View style={[styles.panel, { display: tab === 'library' ? 'flex' : 'none' }]}>
-                    <View style={styles.libraryHeader}>
-                        <View style={styles.libraryHeadingWrap}>
-                            <Text style={styles.sectionTitle}>Моя музыка</Text>
-                            <Text style={styles.sectionHint}>Скачанные аудиофайлы из папки приложения</Text>
-                        </View>
-                        <TouchableOpacity style={styles.smallButton} onPress={loadLocalTracks}>
-                            <Text style={styles.smallButtonText}>↻ Обновить</Text>
-                        </TouchableOpacity>
-                    </View>
-                    <TextInput
-                        style={styles.librarySearchInput}
-                        value={libraryQuery}
-                        onChangeText={setLibraryQuery}
-                        placeholder="Поиск по песням и исполнителям"
-                        placeholderTextColor="#7C879D"
-                        returnKeyType="search"
-                        autoCapitalize="none"
-                        autoCorrect={false}
-                        clearButtonMode="while-editing"
-                    />
-                    {localTracks.length === 0 ? (
-                        <View style={styles.emptyState}>
-                            <Text style={styles.emptyTitle}>Пока здесь пусто</Text>
-                            <Text style={styles.emptyText}>Открой «Поиск / браузер», найди прямую ссылку на разрешённый аудиофайл и скачай его.</Text>
-                        </View>
-                    ) : filteredTracks.length === 0 ? (
-                        <View style={styles.emptyState}>
-                            <Text style={styles.emptyTitle}>Ничего не найдено</Text>
-                            <Text style={styles.emptyText}>Попробуй изменить запрос или очистить строку поиска.</Text>
-                        </View>
-                    ) : (
-                        <FlatList
-                            data={filteredTracks}
-                            keyExtractor={(item) => item.id}
-                            renderItem={renderLocalTrack}
-                            contentContainerStyle={styles.listContent}
-                            keyboardShouldPersistTaps="handled"
+                        <TextInput
+                            style={styles.librarySearchInput}
+                            value={libraryQuery}
+                            onChangeText={setLibraryQuery}
+                            placeholder="Поиск по песням и исполнителям"
+                            placeholderTextColor="#7C879D"
+                            returnKeyType="search"
+                            autoCapitalize="none"
+                            autoCorrect={false}
+                            clearButtonMode="while-editing"
                         />
+                        {localTracks.length === 0 ? (
+                            <View style={styles.emptyState}>
+                                <Text style={styles.emptyTitle}>Пока здесь пусто</Text>
+                                <Text style={styles.emptyText}>Открой «Поиск / браузер», найди прямую ссылку на разрешённый аудиофайл и скачай его.</Text>
+                            </View>
+                        ) : filteredTracks.length === 0 ? (
+                            <View style={styles.emptyState}>
+                                <Text style={styles.emptyTitle}>Ничего не найдено</Text>
+                                <Text style={styles.emptyText}>Попробуй изменить запрос или очистить строку поиска.</Text>
+                            </View>
+                        ) : (
+                            <FlatList
+                                data={filteredTracks}
+                                keyExtractor={(item) => item.id}
+                                renderItem={renderLocalTrack}
+                                contentContainerStyle={styles.listContent}
+                                keyboardShouldPersistTaps="handled"
+                            />
+                        )}
+                    </View>
+
+                    {isLandscape && (
+                        <>
+                            {/* Невидимая полоса у левого края: тянем вправо, чтобы выдвинуть панель */}
+                            <View style={styles.edgeSwipeZone} {...drawerResponders.open.panHandlers} />
+
+                            {/* Виджет слева сверху: нажатие или свайп вправо */}
+                            <View style={styles.drawerHandle} {...drawerResponders.open.panHandlers}>
+                                <TouchableOpacity
+                                    style={styles.drawerHandleTouch}
+                                    activeOpacity={0.7}
+                                    accessibilityLabel="Открыть панель поиска"
+                                    onPress={() => settleDrawer(true)}
+                                >
+                                    <Text style={styles.drawerHandleIcon}>☰</Text>
+                                </TouchableOpacity>
+                            </View>
+
+                            {/* Затемнение: нажатие или свайп влево закрывают панель */}
+                            <Animated.View
+                                pointerEvents={drawerOpen ? 'auto' : 'none'}
+                                style={[styles.drawerScrim, { opacity: drawerProgress }]}
+                                {...drawerResponders.close.panHandlers}
+                            >
+                                <TouchableOpacity activeOpacity={1} style={StyleSheet.absoluteFill} onPress={() => settleDrawer(false)} />
+                            </Animated.View>
+
+                            {/* Сама панель: шапка, вкладки, поиск */}
+                            <Animated.View
+                                pointerEvents={drawerOpen ? 'auto' : 'none'}
+                                style={[
+                                    styles.drawer,
+                                    {
+                                        width: drawerWidth,
+                                        transform: [{
+                                            translateX: drawerProgress.interpolate({
+                                                inputRange: [0, 1],
+                                                outputRange: [-(drawerWidth + 4), 0],
+                                            }),
+                                        }],
+                                    },
+                                ]}
+                                {...drawerResponders.close.panHandlers}
+                            >
+                                <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.drawerContent}>
+                                    {headerBlock}
+                                    {tab === 'browser' && (
+                                        <View style={styles.drawerControls}>
+                                            {searchControls}
+                                            <View style={styles.drawerTitleRow}>
+                                                <View style={styles.drawerTitleWrap}>{pageTitleText}</View>
+                                                {loadingPage && <ActivityIndicator size="small" color="#B9F56D" />}
+                                            </View>
+                                        </View>
+                                    )}
+                                </ScrollView>
+                            </Animated.View>
+                        </>
                     )}
                 </View>
 
@@ -1845,10 +1996,17 @@ export default function App() {
 
 const styles = StyleSheet.create({
     safeArea: { flex: 1, backgroundColor: '#0A0E18' },
-    landscapeHandleArea: { position: 'absolute', top: 0, left: 0, right: 0, height: 34, zIndex: 20, alignItems: 'center', justifyContent: 'flex-start' },
-    landscapeHandle: { width: 64, height: 24, borderBottomLeftRadius: 12, borderBottomRightRadius: 12, backgroundColor: '#151B2B', alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#283149' },
-    landscapeCollapse: { alignSelf: 'center', width: 48, height: 22, alignItems: 'center', justifyContent: 'center', marginBottom: 2 },
-    landscapeHandleText: { color: '#B9F56D', fontSize: 18, fontWeight: '900', lineHeight: 20 },
+    content: { flex: 1 },
+    edgeSwipeZone: { position: 'absolute', top: 54, bottom: 0, left: 0, width: 22, zIndex: 10 },
+    drawerHandle: { position: 'absolute', top: 8, left: 0, width: 38, height: 46, zIndex: 20, borderTopRightRadius: 14, borderBottomRightRadius: 14, backgroundColor: 'rgba(21,27,43,0.92)', borderWidth: 1, borderLeftWidth: 0, borderColor: '#283149' },
+    drawerHandleTouch: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+    drawerHandleIcon: { color: '#B9F56D', fontSize: 20, fontWeight: '900', lineHeight: 22 },
+    drawerScrim: { position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, backgroundColor: 'rgba(0,0,0,0.5)', zIndex: 30 },
+    drawer: { position: 'absolute', top: 0, bottom: 0, left: 0, zIndex: 40, backgroundColor: '#0A0E18', borderRightWidth: 1, borderRightColor: '#283149' },
+    drawerContent: { paddingBottom: 12 },
+    drawerControls: { paddingHorizontal: 12 },
+    drawerTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+    drawerTitleWrap: { flex: 1, minWidth: 0 },
     header: { paddingHorizontal: 18, paddingTop: 10, paddingBottom: 12, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
     logo: { color: '#F4F6FC', fontSize: 27, fontWeight: '900', letterSpacing: 3 },
     subtitle: { color: '#8792A9', marginTop: 2, fontSize: 10, letterSpacing: 1.2 },
